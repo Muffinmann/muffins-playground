@@ -538,9 +538,25 @@ function toNdc(normalizedX, normalizedY) {
 }
 
 class MeshFactory {
-  static createCube() {
-    // TODO: 返回立方体顶点数据。建议先用 TRIANGLES，每个顶点包含 position + color。
-    throw new Error("MeshFactory.createCube is a modelling exercise TODO.");
+  // 返回立方体顶点数据。用 TRIANGLES，每个顶点包含 position + color。
+  static createCube(color = [0.8, 0.35, 0.25]) {
+    const [red, green, blue] = color;
+    const faces = [
+     [[-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5], [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5]], // front
+     [[ 0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5]], // back
+     [[-0.5, -0.5, -0.5], [-0.5, -0.5,  0.5], [-0.5,  0.5,  0.5], [-0.5,  0.5, -0.5]], // left
+     [[ 0.5, -0.5,  0.5], [ 0.5, -0.5, -0.5], [ 0.5,  0.5, -0.5], [ 0.5,  0.5,  0.5]], // right
+     [[-0.5,  0.5,  0.5], [ 0.5,  0.5,  0.5], [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5]], // top
+     [[-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5], [ 0.5, -0.5,  0.5], [-0.5, -0.5,  0.5]], // bottom
+    ]
+    // 每个面用两个三角形，注意 winding 顺序要和 CULL_FACE 匹配。
+    const vertices = []
+    for (const [p0, p1, p2, p3] of faces) {
+      for (const point of [p0, p1, p2, p0, p2, p3]) {
+        vertices.push(point[0], point[1], point[2], red, green, blue)
+      }
+    }
+    return new Float32Array(vertices)
   }
 
   static createSphere() {
@@ -816,6 +832,7 @@ class Viewer {
     // 初始场景只放一个网格，目的是确认 WebGL 管线、相机和 resize 都正常。
     // TODO: 你可以在这里添加 MeshFactory.createCube() 生成的节点，作为第一个建模对象。
     this.scene.add(new Node(buildGrid(10, 1), this.gl.LINES));
+    this.scene.add(new Node(MeshFactory.createCube(), this.gl.TRIANGLES));
   }
 
   resize() {
