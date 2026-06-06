@@ -198,6 +198,147 @@ function createPerspectiveMatrix(fieldOfViewRadians, aspect, near, far) {
   ]);
 }
 
+function multiplyMatrix4(a, b) {
+  // 这里的矩阵都按 WebGL/GLSL 的 column-major 布局存储。
+  // 返回结果等价于 GLSL 里的 a * b。
+  const result = new Float32Array(16);
+
+  for (let column = 0; column < 4; column += 1) {
+    for (let row = 0; row < 4; row += 1) {
+      let sum = 0;
+
+      for (let index = 0; index < 4; index += 1) {
+        sum += a[index * 4 + row] * b[column * 4 + index];
+      }
+
+      result[column * 4 + row] = sum;
+    }
+  }
+
+  return result;
+}
+
+function invertMatrix4(matrix) {
+  // 通用 4x4 矩阵求逆。picking 需要 inverse(projection * view) 来做反投影。
+  const m00 = matrix[0], m01 = matrix[1], m02 = matrix[2], m03 = matrix[3];
+  const m10 = matrix[4], m11 = matrix[5], m12 = matrix[6], m13 = matrix[7];
+  const m20 = matrix[8], m21 = matrix[9], m22 = matrix[10], m23 = matrix[11];
+  const m30 = matrix[12], m31 = matrix[13], m32 = matrix[14], m33 = matrix[15];
+
+  const tmp0 = m22 * m33;
+  const tmp1 = m32 * m23;
+  const tmp2 = m12 * m33;
+  const tmp3 = m32 * m13;
+  const tmp4 = m12 * m23;
+  const tmp5 = m22 * m13;
+  const tmp6 = m02 * m33;
+  const tmp7 = m32 * m03;
+  const tmp8 = m02 * m23;
+  const tmp9 = m22 * m03;
+  const tmp10 = m02 * m13;
+  const tmp11 = m12 * m03;
+  const tmp12 = m20 * m31;
+  const tmp13 = m30 * m21;
+  const tmp14 = m10 * m31;
+  const tmp15 = m30 * m11;
+  const tmp16 = m10 * m21;
+  const tmp17 = m20 * m11;
+  const tmp18 = m00 * m31;
+  const tmp19 = m30 * m01;
+  const tmp20 = m00 * m21;
+  const tmp21 = m20 * m01;
+  const tmp22 = m00 * m11;
+  const tmp23 = m10 * m01;
+
+  const t0 = (tmp0 * m11 + tmp3 * m21 + tmp4 * m31) - (tmp1 * m11 + tmp2 * m21 + tmp5 * m31);
+  const t1 = (tmp1 * m01 + tmp6 * m21 + tmp9 * m31) - (tmp0 * m01 + tmp7 * m21 + tmp8 * m31);
+  const t2 = (tmp2 * m01 + tmp7 * m11 + tmp10 * m31) - (tmp3 * m01 + tmp6 * m11 + tmp11 * m31);
+  const t3 = (tmp5 * m01 + tmp8 * m11 + tmp11 * m21) - (tmp4 * m01 + tmp9 * m11 + tmp10 * m21);
+  const determinant = m00 * t0 + m10 * t1 + m20 * t2 + m30 * t3;
+
+  if (Math.abs(determinant) < 0.000001) {
+    return null;
+  }
+
+  const inverseDeterminant = 1 / determinant;
+
+  return new Float32Array([
+    inverseDeterminant * t0,
+    inverseDeterminant * t1,
+    inverseDeterminant * t2,
+    inverseDeterminant * t3,
+    inverseDeterminant * ((tmp1 * m10 + tmp2 * m20 + tmp5 * m30) - (tmp0 * m10 + tmp3 * m20 + tmp4 * m30)),
+    inverseDeterminant * ((tmp0 * m00 + tmp7 * m20 + tmp8 * m30) - (tmp1 * m00 + tmp6 * m20 + tmp9 * m30)),
+    inverseDeterminant * ((tmp3 * m00 + tmp6 * m10 + tmp11 * m30) - (tmp2 * m00 + tmp7 * m10 + tmp10 * m30)),
+    inverseDeterminant * ((tmp4 * m00 + tmp9 * m10 + tmp10 * m20) - (tmp5 * m00 + tmp8 * m10 + tmp11 * m20)),
+    inverseDeterminant * ((tmp12 * m13 + tmp15 * m23 + tmp16 * m33) - (tmp13 * m13 + tmp14 * m23 + tmp17 * m33)),
+    inverseDeterminant * ((tmp13 * m03 + tmp18 * m23 + tmp21 * m33) - (tmp12 * m03 + tmp19 * m23 + tmp20 * m33)),
+    inverseDeterminant * ((tmp14 * m03 + tmp19 * m13 + tmp22 * m33) - (tmp15 * m03 + tmp18 * m13 + tmp23 * m33)),
+    inverseDeterminant * ((tmp17 * m03 + tmp20 * m13 + tmp23 * m23) - (tmp16 * m03 + tmp21 * m13 + tmp22 * m23)),
+    inverseDeterminant * ((tmp14 * m22 + tmp17 * m32 + tmp13 * m12) - (tmp16 * m32 + tmp12 * m12 + tmp15 * m22)),
+    inverseDeterminant * ((tmp20 * m32 + tmp12 * m02 + tmp19 * m22) - (tmp18 * m22 + tmp21 * m32 + tmp13 * m02)),
+    inverseDeterminant * ((tmp18 * m12 + tmp23 * m32 + tmp15 * m02) - (tmp22 * m32 + tmp14 * m02 + tmp19 * m12)),
+    inverseDeterminant * ((tmp22 * m22 + tmp16 * m02 + tmp21 * m12) - (tmp20 * m12 + tmp23 * m22 + tmp17 * m02)),
+  ]);
+}
+
+function transformPoint4(matrix, point) {
+  return [
+    matrix[0] * point[0] + matrix[4] * point[1] + matrix[8] * point[2] + matrix[12] * point[3],
+    matrix[1] * point[0] + matrix[5] * point[1] + matrix[9] * point[2] + matrix[13] * point[3],
+    matrix[2] * point[0] + matrix[6] * point[1] + matrix[10] * point[2] + matrix[14] * point[3],
+    matrix[3] * point[0] + matrix[7] * point[1] + matrix[11] * point[2] + matrix[15] * point[3],
+  ];
+}
+
+function homogeneousDivide(point) {
+  return [
+    point[0] / point[3],
+    point[1] / point[3],
+    point[2] / point[3],
+  ];
+}
+
+function intersectRayAabb(ray, bounds) {
+  // Slab method：分别计算 ray 进入/离开 x/y/z 三组平面的 t 区间。
+  // 三个轴的区间有交集，就表示 ray 穿过 AABB。
+  let tMin = 0;
+  let tMax = Infinity;
+
+  for (let axis = 0; axis < 3; axis += 1) {
+    const origin = ray.origin[axis];
+    const direction = ray.direction[axis];
+    const min = bounds.min[axis];
+    const max = bounds.max[axis];
+
+    if (Math.abs(direction) < 0.000001) {
+      if (origin < min || origin > max) {
+        return null;
+      }
+
+      continue;
+    }
+
+    let t1 = (min - origin) / direction;
+    let t2 = (max - origin) / direction;
+
+    if (t1 > t2) {
+      const temp = t1;
+      t1 = t2;
+      t2 = temp;
+    }
+
+    tMin = Math.max(tMin, t1);
+    tMax = Math.min(tMax, t2);
+
+    if (tMin > tMax) {
+      return null;
+    }
+  }
+
+  return tMin;
+}
+
 function normalizeVector(vector) {
   const length = Math.hypot(vector[0], vector[1], vector[2]);
 
@@ -379,7 +520,31 @@ class Geometry {
       return Math.max(size, attribute.offset + attribute.size);
     }, 0);
     this.vertexCount = vertices.length / this.vertexSize;
+    this.bounds = this.computeLocalBounds();
     this.buffer = null;
+  }
+
+  computeLocalBounds() {
+    const positionAttribute = this.layout.find((attribute) => attribute.name === "a_position");
+
+    if (!positionAttribute) {
+      return null;
+    }
+
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+
+    for (let vertex = 0; vertex < this.vertexCount; vertex += 1) {
+      const base = vertex * this.vertexSize + positionAttribute.offset;
+
+      for (let axis = 0; axis < 3; axis += 1) {
+        const value = this.vertices[base + axis];
+        min[axis] = Math.min(min[axis], value);
+        max[axis] = Math.max(max[axis], value);
+      }
+    }
+
+    return { min, max };
   }
 
   upload(gl) {
@@ -484,10 +649,13 @@ class Node {
   }
 
   hitTest(ray) {
-    // TODO: 实现拾取检测。常见做法是先算 AABB，再测试鼠标射线是否穿过包围盒。
-    // ray 预期包含 origin/direction，通常由 Interaction 根据鼠标位置和相机矩阵反投影得到。
-    void ray;
-    return false;
+    // 当前 transform 还是 identity，因此 local AABB 可以暂时直接当 world AABB 使用。
+    // 等 Transform.matrix() 实现后，应把 ray 变换到 node local space 或把 bounds 变换到 world space。
+    if (!(this.material instanceof LambertMaterial) || !this.geometry.bounds) {
+      return null;
+    }
+
+    return intersectRayAabb(ray, this.geometry.bounds);
   }
 
   updateModelMatrix() {
@@ -522,8 +690,19 @@ class Scene {
   }
 
   findByRay(ray) {
-    // TODO: 实现从后往前或按距离排序的拾取逻辑，返回鼠标射线命中的最近节点。
-    return this.nodes.find((node) => node.hitTest(ray)) || null;
+    let nearestNode = null;
+    let nearestDistance = Infinity;
+
+    for (const node of this.nodes) {
+      const distance = node.hitTest(ray);
+
+      if (distance !== null && distance < nearestDistance) {
+        nearestDistance = distance;
+        nearestNode = node;
+      }
+    }
+
+    return nearestNode;
   }
 
   render(gl, renderState) {
@@ -646,20 +825,50 @@ class SelectionManager {
     this.selectedNode = null;
   }
 
-  pick(normalizedX, normalizedY) {
-    // TODO: 把 0..1 的屏幕坐标反投影成世界空间 ray，然后调用 scene.findByRay(ray)。
-    // normalizedX/normalizedY 是 canvas 归一化坐标；需要 WebGL NDC 时按需调用 toNdc。
+  createRayFromPointer(normalizedX, normalizedY) {
     const ndc = toNdc(normalizedX, normalizedY);
-    void ndc;
-    void normalizedX;
-    void normalizedY;
-    void this.camera;
-    return this.scene.findByRay(null);
+    const viewProjection = multiplyMatrix4(this.camera.projectionMatrix, this.camera.viewMatrix);
+    const inverseViewProjection = invertMatrix4(viewProjection);
+
+    if (!inverseViewProjection) {
+      return null;
+    }
+
+    const nearClip = [ndc.x, ndc.y, -1, 1];
+    const farClip = [ndc.x, ndc.y, 1, 1];
+    const nearWorld = homogeneousDivide(transformPoint4(inverseViewProjection, nearClip));
+    const farWorld = homogeneousDivide(transformPoint4(inverseViewProjection, farClip));
+
+    return {
+      // 使用 near plane 作为 origin：它是可见视锥的起点，比 eye 更贴近“屏幕上这个像素”。
+      origin: nearWorld,
+      direction: normalizeVector(subtractVectors(farWorld, nearWorld)),
+    };
+  }
+
+  pick(normalizedX, normalizedY) {
+    const ray = this.createRayFromPointer(normalizedX, normalizedY);
+
+    if (!ray) {
+      this.clear();
+      return null;
+    }
+
+    const node = this.scene.findByRay(ray);
+
+    console.log("pick: ", node)
+    if (node) {
+      this.select(node);
+    } else {
+      this.clear();
+    }
+
+    return node;
   }
 }
 
 function toNdc(normalizedX, normalizedY) {
-  // NDC 是 WebGL 的 -1..1 坐标系。不要把它长期存在 pointer 状态里；
+  // NDC(Normalized Device Coordinates) 是 WebGL 的 -1..1 坐标系。不要把它长期存在 pointer 状态里；
   // 在 picking/unproject 这类真正需要 WebGL 坐标的地方按需派生即可。
   return {
     x: normalizedX * 2 - 1,
@@ -934,6 +1143,7 @@ class Viewer {
 
     this.interaction.registerCallback("move", (pointer) => {
       // TODO: 如果有 selectedNode，把 pointer.deltaX/deltaY 转成世界空间位移。
+      console.log("move:", pointer)
       void pointer;
     });
 
