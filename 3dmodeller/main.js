@@ -446,15 +446,58 @@ class Camera {
   }
 
   pan(deltaX, deltaY) {
-    // TODO: 平移 eye 和 target，让相机视角在工作平面上移动。
-    void deltaX;
-    void deltaY;
+    // 平移 eye 和 target，让相机视角在工作平面上移动。
+    const offset = subtractVectors(this.eye, this.target)
+    const distance = Math.hypot(offset[0], offset[1], offset[2])
+    const zAxis = normalizeVector(offset)
+    const xAxis = normalizeVector(crossVectors(this.up, zAxis))
+    const yAxis = crossVectors(zAxis, xAxis)
+
+    const speed = distance * 1.5;
+
+    const movement = [
+      (-xAxis[0] * deltaX + yAxis[0] * deltaY) * speed,
+      (-xAxis[1] * deltaX + yAxis[1] * deltaY) * speed,
+      (-xAxis[2] * deltaX + yAxis[2] * deltaY) * speed,
+    ]
+    this.eye = [
+      this.eye[0] + movement[0],
+      this.eye[1] + movement[1],
+      this.eye[2] + movement[2],
+    ]
+
+    this.target = [
+      this.target[0] + movement[0],
+      this.target[1] + movement[1],
+      this.target[2] + movement[2],
+    ]
+
+    this.updateViewMatrix()
   }
 
   zoom(delta) {
-    // TODO: 沿 eye -> target 方向移动相机，或调整 fieldOfView。
-    void delta;
+    //  沿 eye -> target 方向移动相机
+    const offset = subtractVectors(this.eye, this.target)
+    const distance = Math.hypot(offset[0], offset[1], offset[2])
+
+    const speed = distance * 0.001
+    const amount = delta * speed
+
+    const minDistance = 0.5
+    const maxDistance = 100
+    const nextDistance = clamp(distance + amount, minDistance, maxDistance)
+
+    const direction = normalizeVector(offset)
+
+    this.eye = [
+      this.target[0] + direction[0] * nextDistance,
+      this.target[1] + direction[1] * nextDistance,
+      this.target[2] + direction[2] * nextDistance,
+    ]
+
+    this.updateViewMatrix()
   }
+
 }
 
 class SelectionManager {
@@ -475,12 +518,23 @@ class SelectionManager {
 
   pick(normalizedX, normalizedY) {
     // TODO: 把 0..1 的屏幕坐标反投影成世界空间 ray，然后调用 scene.findByRay(ray)。
-    // normalizedX/normalizedY 来自 Interaction.updatePointer。
+    // normalizedX/normalizedY 是 canvas 归一化坐标；需要 WebGL NDC 时按需调用 toNdc。
+    const ndc = toNdc(normalizedX, normalizedY);
+    void ndc;
     void normalizedX;
     void normalizedY;
     void this.camera;
     return this.scene.findByRay(null);
   }
+}
+
+function toNdc(normalizedX, normalizedY) {
+  // NDC 是 WebGL 的 -1..1 坐标系。不要把它长期存在 pointer 状态里；
+  // 在 picking/unproject 这类真正需要 WebGL 坐标的地方按需派生即可。
+  return {
+    x: normalizedX * 2 - 1,
+    y: 1 - normalizedY * 2,
+  };
 }
 
 class MeshFactory {
@@ -500,66 +554,185 @@ class MeshFactory {
   }
 }
 
-class Interaction {
-  constructor(canvas, camera, selection) {
-    this.canvas = canvas;
-    this.camera = camera;
-    this.selection = selection;
-    this.pointer = {
-      x: 0,
-      y: 0,
-      isDown: false,
-    };
+const MouseButtons = Object.freeze({
+  LEFT: "left",
+  MIDDLE: "middle",
+  RIGHT: "right",
+});
 
+function normalizeMouseButton(button) {
+  // DOM 事件里的 button 是浏览器/平台层数字。这里把它翻译成建模器能理解的语义名称。
+  // 之后模型层只关心 "left"/"middle"/"right"，不需要知道浏览器使用 0/1/2。
+  if (button === 0) {
+    return MouseButtons.LEFT;
+  }
+
+  if (button === 1) {
+    return MouseButtons.MIDDLE;
+  }
+
+  if (button === 2) {
+    return MouseButtons.RIGHT;
+  }
+
+  return null;
+}
+
+class BrowserInputAdapter {
+  constructor(canvas, interaction) {
+    // Adapter 是系统边界：它知道 DOM event、canvas rect、contextmenu、pointer capture。
+    // Interaction 只接收归一化后的 modeller input，不直接依赖浏览器事件对象。
+    this.canvas = canvas;
+    this.interaction = interaction;
     this.install();
   }
 
   install() {
+    this.canvas.addEventListener("contextmenu", (event) => {
+      // 禁用 canvas 上的浏览器右键菜单，否则右键拖拽会弹出 Copy Image As / Inspect。
+      event.preventDefault();
+    });
+
     this.canvas.addEventListener("pointerdown", (event) => {
-      this.pointer.isDown = true;
-      this.updatePointer(event);
-      // TODO: 鼠标按下时可以调用 selection.pick(pointer.x, pointer.y) 完成选择。
-      // 当前先只记录状态，避免替你实现拾取细节。
+      event.preventDefault();
+      this.interaction.handlePointerDown(this.createPointerInput(event));
       this.canvas.setPointerCapture(event.pointerId);
     });
 
     this.canvas.addEventListener("pointermove", (event) => {
-      const prevX = this.pointer.x;
-      const prevY = this.pointer.y;
-      this.updatePointer(event);
-      // TODO: 如果 pointer.isDown 且已选中节点，可以把鼠标移动转换为模型移动。
-      // 如果未选中节点，可以把拖动解释为 camera.orbit 或 camera.pan。
-      if (this.pointer.isDown) {
-        const deltaX = this.pointer.x - prevX;
-        const deltaY = this.pointer.y - prevY;
-        this.camera.orbit(deltaX, deltaY);
-      }
+      this.interaction.handlePointerMove(this.createPointerInput(event));
     });
 
     this.canvas.addEventListener("pointerup", (event) => {
-      this.pointer.isDown = false;
-      this.updatePointer(event);
+      this.interaction.handlePointerUp(this.createPointerInput(event));
       this.canvas.releasePointerCapture(event.pointerId);
+    });
+
+    this.canvas.addEventListener("pointercancel", (event) => {
+      this.interaction.handlePointerUp(this.createPointerInput(event));
     });
 
     this.canvas.addEventListener("wheel", (event) => {
       // preventDefault 阻止页面滚动，把滚轮留给 3D 视图做 zoom。
       event.preventDefault();
-      // TODO: 调用 camera.zoom(event.deltaY)，再更新 view matrix。
-      void this.camera;
+      this.interaction.handleWheel({
+        ...this.createPointerInput(event),
+        delta: event.deltaY,
+      });
     }, { passive: false });
 
     window.addEventListener("keydown", (event) => {
-      // TODO: 在这里接入 delete、escape、数字键切换工具等快捷键。
-      this.lastKey = event.key;
+      this.interaction.handleKey({
+        key: event.key,
+        code: event.code,
+        pointer: this.interaction.pointer,
+      });
     });
   }
 
-  updatePointer(event) {
+  createPointerInput(event) {
     const rect = this.canvas.getBoundingClientRect();
-    // 存成 0..1 的归一化屏幕坐标，比直接存像素更方便适配 resize 和高 DPI。
-    this.pointer.x = (event.clientX - rect.left) / rect.width;
-    this.pointer.y = (event.clientY - rect.top) / rect.height;
+    const x = (event.clientX - rect.left) / rect.width;
+    const y = (event.clientY - rect.top) / rect.height;
+
+    return {
+      x,
+      y,
+      button: normalizeMouseButton(event.button),
+      pointerId: event.pointerId,
+    };
+  }
+}
+
+class Interaction {
+  constructor() {
+    // Interaction 是建模器自己的输入模型，参考 AOSA 里的 pressed/mouse_loc/callbacks。
+    // 它不认识 DOM event，也不直接调用 camera/selection；这些都通过 callback 连接。
+    this.pointer = {
+      x: 0,
+      y: 0,
+    };
+    this.previousPointer = null;
+    this.pressedButton = null;
+    this.callbacks = Object.create(null);
+  }
+
+  registerCallback(name, handler) {
+    if (!this.callbacks[name]) {
+      this.callbacks[name] = [];
+    }
+
+    this.callbacks[name].push(handler);
+  }
+
+  trigger(name, payload) {
+    for (const handler of this.callbacks[name] || []) {
+      handler(payload);
+    }
+  }
+
+  handlePointerDown(input) {
+    this.pressedButton = input.button;
+    this.pointer = input;
+    this.previousPointer = input;
+
+    if (input.button === MouseButtons.LEFT) {
+      // AOSA 语义：左键按下先尝试 pick。真正的选择逻辑由 SelectionManager callback 实现。
+      this.trigger("pick", input);
+    }
+  }
+
+  handlePointerMove(input) {
+    const previous = this.previousPointer || input;
+    const payload = {
+      ...input,
+      deltaX: input.x - previous.x,
+      deltaY: input.y - previous.y,
+      pressedButton: this.pressedButton,
+    };
+
+    this.pointer = input;
+    this.previousPointer = input;
+
+    if (this.pressedButton === MouseButtons.LEFT) {
+      // AOSA 语义：左键拖动移动已选对象。当前 move 只是事件，模型移动后续实现。
+      this.trigger("move", payload);
+    } else if (this.pressedButton === MouseButtons.RIGHT) {
+      // AOSA 语义：右键拖动旋转视图。当前实现接到 Camera.orbit。
+      this.trigger("orbit", payload);
+    } else if (this.pressedButton === MouseButtons.MIDDLE) {
+      // AOSA 语义：中键拖动平移视图。
+      this.trigger("pan", payload);
+    }
+  }
+
+  handlePointerUp(input) {
+    this.pointer = input;
+    this.previousPointer = null;
+    this.pressedButton = null;
+  }
+
+  handleWheel(input) {
+    this.pointer = input;
+    this.trigger("zoom", input);
+  }
+
+  handleKey(input) {
+    // AOSA 里键盘输入会触发 place/scale/rotate_color 等建模器事件。
+    // 这里先只建立事件边界，具体命令可以在 Viewer 里注册 callback。
+    if (input.key === "s") {
+      this.trigger("place", { shape: "sphere", pointer: input.pointer });
+    } else if (input.key === "c") {
+      this.trigger("place", { shape: "cube", pointer: input.pointer });
+    } else if (input.key === "ArrowUp") {
+      this.trigger("scale", { up: true });
+    } else if (input.key === "ArrowDown") {
+      this.trigger("scale", { up: false });
+    } else if (input.key === "ArrowLeft") {
+      this.trigger("rotate_color", { forward: true });
+    } else if (input.key === "ArrowRight") {
+      this.trigger("rotate_color", { forward: false });
+    }
   }
 }
 
@@ -573,11 +746,36 @@ class Viewer {
     this.scene = new Scene();
     this.camera = new Camera();
     this.selection = new SelectionManager(this.scene, this.camera);
-    this.interaction = new Interaction(canvas, this.camera, this.selection);
+    this.interaction = new Interaction();
+    this.inputAdapter = new BrowserInputAdapter(canvas, this.interaction);
+    this.registerInteractionCallbacks();
 
     this.configureWebGL();
     this.installResizeHandler();
     this.seedScene();
+  }
+
+  registerInteractionCallbacks() {
+    this.interaction.registerCallback("pick", (pointer) => {
+      this.selection.pick(pointer.x, pointer.y);
+    });
+
+    this.interaction.registerCallback("move", (pointer) => {
+      // TODO: 如果有 selectedNode，把 pointer.deltaX/deltaY 转成世界空间位移。
+      void pointer;
+    });
+
+    this.interaction.registerCallback("orbit", (pointer) => {
+      this.camera.orbit(pointer.deltaX, pointer.deltaY);
+    });
+
+    this.interaction.registerCallback("pan", (pointer) => {
+      this.camera.pan(pointer.deltaX, pointer.deltaY);
+    });
+
+    this.interaction.registerCallback("zoom", (input) => {
+      this.camera.zoom(input.delta);
+    });
   }
 
   createContext(canvas) {
