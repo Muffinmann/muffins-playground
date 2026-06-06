@@ -185,6 +185,69 @@ function createIdentityMatrix() {
   ]);
 }
 
+function createTranslationMatrix(position) {
+  // column-major layout：最后一列存储平移分量。
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, 1, 0, 0,
+    0, 0, 1, 0,
+    position[0], position[1], position[2], 1,
+  ]);
+}
+
+function createRotationXMatrix(radians) {
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+
+  return new Float32Array([
+    1, 0, 0, 0,
+    0, cosine, sine, 0,
+    0, -sine, cosine, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+function createRotationYMatrix(radians) {
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+
+  return new Float32Array([
+    cosine, 0, -sine, 0,
+    0, 1, 0, 0,
+    sine, 0, cosine, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+function createRotationZMatrix(radians) {
+  const cosine = Math.cos(radians);
+  const sine = Math.sin(radians);
+
+  return new Float32Array([
+    cosine, sine, 0, 0,
+    -sine, cosine, 0, 0,
+    0, 0, 1, 0,
+    0, 0, 0, 1,
+  ]);
+}
+
+function createRotationMatrix(rotation) {
+  const rotationX = createRotationXMatrix(rotation[0]);
+  const rotationY = createRotationYMatrix(rotation[1]);
+  const rotationZ = createRotationZMatrix(rotation[2]);
+
+  return multiplyMatrix4(rotationZ, multiplyMatrix4(rotationY, rotationX));
+}
+
+function createScaleMatrix(scale) {
+  return new Float32Array([
+    scale[0], 0, 0, 0,
+    0, scale[1], 0, 0,
+    0, 0, scale[2], 0,
+    0, 0, 0, 1,
+  ]);
+}
+
 function createPerspectiveMatrix(fieldOfViewRadians, aspect, near, far) {
   // 透视投影让远处物体变小；near/far 定义可见深度范围，也影响 depth buffer 精度。
   const f = 1.0 / Math.tan(fieldOfViewRadians / 2);
@@ -337,6 +400,47 @@ function intersectRayAabb(ray, bounds) {
   }
 
   return tMin;
+}
+
+function intersectRayPlane(ray, point, normal) {
+  const denominator = dotVectors(ray.direction, normal);
+
+  if (Math.abs(denominator) < 0.000001) {
+    return null;
+  }
+
+  const distance = dotVectors(subtractVectors(point, ray.origin), normal) / denominator;
+
+  if (distance < 0) {
+    return null;
+  }
+
+  return [
+    ray.origin[0] + ray.direction[0] * distance,
+    ray.origin[1] + ray.direction[1] * distance,
+    ray.origin[2] + ray.direction[2] * distance,
+  ];
+}
+
+function transformBounds(matrix, bounds) {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+
+  for (const x of [bounds.min[0], bounds.max[0]]) {
+    for (const y of [bounds.min[1], bounds.max[1]]) {
+      for (const z of [bounds.min[2], bounds.max[2]]) {
+        const point = transformPoint4(matrix, [x, y, z, 1]);
+        const worldPoint = homogeneousDivide(point);
+
+        for (let axis = 0; axis < 3; axis += 1) {
+          min[axis] = Math.min(min[axis], worldPoint[axis]);
+          max[axis] = Math.max(max[axis], worldPoint[axis]);
+        }
+      }
+    }
+  }
+
+  return { min, max };
 }
 
 function normalizeVector(vector) {
@@ -624,17 +728,17 @@ class LambertMaterial extends Material {
 
 class Transform {
   constructor() {
-    // TODO: 把模型的平移、旋转、缩放集中在这里。
-    // 之后 Node 不应该手写 modelMatrix，而是从 Transform 生成。
     this.position = [0, 0, 0];
     this.rotation = [0, 0, 0];
     this.scale = [1, 1, 1];
   }
 
   matrix() {
-    // TODO: 实现 translate * rotate * scale 的组合矩阵。
-    // 现在先返回 identity，保证脚手架不会改变现有网格的位置。
-    return createIdentityMatrix();
+    const translation = createTranslationMatrix(this.position);
+    const rotation = createRotationMatrix(this.rotation);
+    const scale = createScaleMatrix(this.scale);
+
+    return multiplyMatrix4(translation, multiplyMatrix4(rotation, scale));
   }
 }
 
@@ -649,17 +753,16 @@ class Node {
   }
 
   hitTest(ray) {
-    // 当前 transform 还是 identity，因此 local AABB 可以暂时直接当 world AABB 使用。
-    // 等 Transform.matrix() 实现后，应把 ray 变换到 node local space 或把 bounds 变换到 world space。
     if (!(this.material instanceof LambertMaterial) || !this.geometry.bounds) {
       return null;
     }
 
-    return intersectRayAabb(ray, this.geometry.bounds);
+    const worldBounds = transformBounds(this.modelMatrix, this.geometry.bounds);
+
+    return intersectRayAabb(ray, worldBounds);
   }
 
   updateModelMatrix() {
-    // TODO: 当 Transform 实现后，用 this.transform.matrix() 取代手动维护 modelMatrix。
     this.modelMatrix = this.transform.matrix();
   }
 
@@ -814,6 +917,9 @@ class SelectionManager {
     this.scene = scene;
     this.camera = camera;
     this.selectedNode = null;
+    this.lastMovePoint = null;
+    this.movePlanePoint = null;
+    this.movePlaneNormal = null;
   }
 
   select(node) {
@@ -823,6 +929,9 @@ class SelectionManager {
 
   clear() {
     this.selectedNode = null;
+    this.lastMovePoint = null;
+    this.movePlanePoint = null;
+    this.movePlaneNormal = null;
   }
 
   createRayFromPointer(normalizedX, normalizedY) {
@@ -856,14 +965,56 @@ class SelectionManager {
 
     const node = this.scene.findByRay(ray);
 
-    console.log("pick: ", node)
     if (node) {
       this.select(node);
+      this.movePlanePoint = [...node.transform.position];
+      this.movePlaneNormal = normalizeVector(subtractVectors(this.camera.eye, this.camera.target));
+      this.lastMovePoint = intersectRayPlane(ray, this.movePlanePoint, this.movePlaneNormal);
     } else {
       this.clear();
     }
 
     return node;
+  }
+
+  moveSelected(normalizedX, normalizedY) {
+    if (!this.selectedNode) {
+      return null;
+    }
+
+    const ray = this.createRayFromPointer(normalizedX, normalizedY);
+
+    if (!ray) {
+      return null;
+    }
+
+    if (!this.movePlanePoint || !this.movePlaneNormal) {
+      this.movePlanePoint = [...this.selectedNode.transform.position];
+      this.movePlaneNormal = normalizeVector(subtractVectors(this.camera.eye, this.camera.target));
+    }
+
+    const currentPoint = intersectRayPlane(ray, this.movePlanePoint, this.movePlaneNormal);
+
+    if (!currentPoint) {
+      return null;
+    }
+
+    if (!this.lastMovePoint) {
+      this.lastMovePoint = currentPoint;
+      return this.selectedNode.transform.position;
+    }
+
+    const delta = subtractVectors(currentPoint, this.lastMovePoint);
+    const position = this.selectedNode.transform.position;
+    this.selectedNode.transform.position = [
+      position[0] + delta[0],
+      position[1] + delta[1],
+      position[2] + delta[2],
+    ];
+    this.selectedNode.updateModelMatrix();
+    this.lastMovePoint = currentPoint;
+
+    return this.selectedNode.transform.position;
   }
 }
 
@@ -1142,9 +1293,7 @@ class Viewer {
     });
 
     this.interaction.registerCallback("move", (pointer) => {
-      // TODO: 如果有 selectedNode，把 pointer.deltaX/deltaY 转成世界空间位移。
-      console.log("move:", pointer)
-      void pointer;
+      this.selection.moveSelected(pointer.x, pointer.y);
     });
 
     this.interaction.registerCallback("orbit", (pointer) => {
