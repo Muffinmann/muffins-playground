@@ -73,6 +73,54 @@ void main() {
 }
 `;
 
+const litVertexShaderSource = `#version 300 es
+// Lit shader 比 unlit shader 多读一个 a_normal。
+// normal 是表面朝向，光照计算靠它判断这个面有多“朝向光源”。
+in vec3 a_position;
+in vec3 a_normal;
+in vec3 a_color;
+
+uniform mat4 u_projection;
+uniform mat4 u_view;
+uniform mat4 u_model;
+
+out vec3 v_color;
+out vec3 v_normal;
+
+void main() {
+  v_color = a_color;
+
+  // normal 是方向，不是点，所以只需要模型矩阵里的旋转/缩放部分。
+  // 这里先用 mat3(u_model) 做简化；如果以后支持非等比缩放，要改成 normal matrix。
+  v_normal = mat3(u_model) * a_normal;
+
+  gl_Position = u_projection * u_view * u_model * vec4(a_position, 1.0);
+}
+`;
+
+const litFragmentShaderSource = `#version 300 es
+precision mediump float;
+
+in vec3 v_color;
+in vec3 v_normal;
+
+// directional light：只表示光照方向，不表示光源位置。
+uniform vec3 u_lightDirection;
+// ambient light：最低亮度，避免背光面完全黑掉。
+uniform vec3 u_ambientLight;
+
+out vec4 outColor;
+
+void main() {
+  vec3 normal = normalize(v_normal);
+  vec3 lightDirection = normalize(u_lightDirection);
+  float diffuse = max(dot(normal, lightDirection), 0.0);
+  vec3 litColor = v_color * (u_ambientLight + diffuse);
+
+  outColor = vec4(litColor, 1.0);
+}
+`;
+
 function createShader(gl, type, source) {
   // createShader 只创建 GPU shader 对象；真正的 GLSL 源码还要通过 shaderSource 绑定进去。
   const shader = gl.createShader(type);
@@ -275,28 +323,137 @@ function buildGrid(size, step) {
   return new Float32Array(vertices);
 }
 
-class RenderProgram {
-  constructor(gl) {
+class ShaderProgram {
+  constructor(gl, vertexSource, fragmentSource) {
+    // ShaderProgram 只负责 GPU program 本身：compile/link/use 和 location 查询。
+    // 它不应该知道一个物体是什么材质，也不应该知道 geometry 的业务含义。
     this.gl = gl;
-    this.program = createProgram(gl, vertexShaderSource, fragmentShaderSource);
-    // attribute location 指向 vertex buffer 中的 per-vertex 字段。
-    // uniform location 指向每次 draw call 共享的参数，比如矩阵、材质、灯光。
-    this.locations = {
-      position: gl.getAttribLocation(this.program, "a_position"),
-      color: gl.getAttribLocation(this.program, "a_color"),
-      projection: gl.getUniformLocation(this.program, "u_projection"),
-      view: gl.getUniformLocation(this.program, "u_view"),
-      model: gl.getUniformLocation(this.program, "u_model"),
-    };
+    this.program = createProgram(gl, vertexSource, fragmentSource);
+    this.attributeLocations = new Map();
+    this.uniformLocations = new Map();
   }
 
-  use(projection, view) {
-    const gl = this.gl;
-    // useProgram 切换当前 draw call 使用的 shader program。
-    gl.useProgram(this.program);
-    // uniformMatrix4fv 把 CPU 侧矩阵传进 shader；第二个参数 false 表示不转置。
-    gl.uniformMatrix4fv(this.locations.projection, false, projection);
-    gl.uniformMatrix4fv(this.locations.view, false, view);
+  use() {
+    this.gl.useProgram(this.program);
+  }
+
+  attributeLocation(name) {
+    if (!this.attributeLocations.has(name)) {
+      this.attributeLocations.set(name, this.gl.getAttribLocation(this.program, name));
+    }
+
+    return this.attributeLocations.get(name);
+  }
+
+  uniformLocation(name) {
+    if (!this.uniformLocations.has(name)) {
+      this.uniformLocations.set(name, this.gl.getUniformLocation(this.program, name));
+    }
+
+    return this.uniformLocations.get(name);
+  }
+
+  setMatrix4(name, matrix) {
+    const location = this.uniformLocation(name);
+    if (location) {
+      this.gl.uniformMatrix4fv(location, false, matrix);
+    }
+  }
+
+  setVector3(name, vector) {
+    const location = this.uniformLocation(name);
+    if (location) {
+      this.gl.uniform3fv(location, vector);
+    }
+  }
+}
+
+class Geometry {
+  constructor(vertices, drawMode, layout) {
+    // Geometry 只负责顶点数据、buffer、attribute layout 和 draw call。
+    // layout 的 offset 单位是 float，不是 byte。
+    this.vertices = vertices;
+    this.drawMode = drawMode;
+    this.layout = layout;
+    this.vertexSize = layout.reduce((size, attribute) => {
+      return Math.max(size, attribute.offset + attribute.size);
+    }, 0);
+    this.vertexCount = vertices.length / this.vertexSize;
+    this.buffer = null;
+  }
+
+  upload(gl) {
+    this.buffer = createBuffer(gl, this.vertices, gl.STATIC_DRAW);
+  }
+
+  bind(gl, shaderProgram) {
+    if (!this.buffer) {
+      this.upload(gl);
+    }
+
+    const stride = this.vertexSize * Float32Array.BYTES_PER_ELEMENT;
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+
+    for (const attribute of this.layout) {
+      const location = shaderProgram.attributeLocation(attribute.name);
+
+      if (location === -1) {
+        continue;
+      }
+
+      gl.enableVertexAttribArray(location);
+      gl.vertexAttribPointer(
+        location,
+        attribute.size,
+        gl.FLOAT,
+        false,
+        stride,
+        attribute.offset * Float32Array.BYTES_PER_ELEMENT,
+      );
+    }
+  }
+
+  draw(gl, shaderProgram) {
+    this.bind(gl, shaderProgram);
+    gl.drawArrays(this.drawMode, 0, this.vertexCount);
+    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  }
+}
+
+class Material {
+  constructor(shaderProgram) {
+    // Material 负责“怎么画”：选择 shader，并在 draw 前设置 uniform。
+    // 具体顶点从哪里读，由 Geometry 决定。
+    this.program = shaderProgram;
+  }
+
+  applyBaseUniforms(renderState, node) {
+    this.program.use();
+    this.program.setMatrix4("u_projection", renderState.projectionMatrix);
+    this.program.setMatrix4("u_view", renderState.viewMatrix);
+    this.program.setMatrix4("u_model", node.modelMatrix);
+  }
+
+  apply(renderState, node) {
+    this.applyBaseUniforms(renderState, node);
+  }
+}
+
+class UnlitMaterial extends Material {
+}
+
+class LambertMaterial extends Material {
+  constructor(shaderProgram, options = {}) {
+    super(shaderProgram);
+    this.lightDirection = normalizeVector(options.lightDirection || [0.4, 0.8, 0.6]);
+    this.ambientLight = options.ambientLight || [0.25, 0.25, 0.25];
+  }
+
+  apply(renderState, node) {
+    super.apply(renderState, node);
+    this.program.setVector3("u_lightDirection", this.lightDirection);
+    this.program.setVector3("u_ambientLight", this.ambientLight);
   }
 }
 
@@ -317,21 +474,13 @@ class Transform {
 }
 
 class Node {
-  constructor(vertices, drawMode) {
+  constructor(geometry, material) {
     // Node 是 scene graph 的最小渲染单元。
-    // 你可以从这里拆出 CubeNode/SphereNode/GroupNode，并给每种节点不同的 mesh 和行为。
-    this.vertices = vertices;
-    this.drawMode = drawMode;
+    // 它只组合 transform + geometry + material；不要再让 Node 管 shader/buffer 细节。
+    this.geometry = geometry;
+    this.material = material;
     this.transform = new Transform();
     this.modelMatrix = createIdentityMatrix();
-    this.vertexCount = vertices.length / 6;
-    this.buffer = null;
-  }
-
-  upload(gl) {
-    // 延迟上传：只有第一次 render 时才把顶点数据送到 GPU。
-    // 后续如果节点几何形状变化，需要重新 bufferData 或换成 DYNAMIC_DRAW。
-    this.buffer = createBuffer(gl, this.vertices, gl.STATIC_DRAW);
   }
 
   hitTest(ray) {
@@ -346,28 +495,9 @@ class Node {
     this.modelMatrix = this.transform.matrix();
   }
 
-  render(gl, program) {
-    if (!this.buffer) {
-      this.upload(gl);
-    }
-
-    // stride 表示两个相邻顶点在 buffer 里相隔多少字节。
-    // 当前布局是 position(3 floats) + color(3 floats)。
-    const stride = 6 * Float32Array.BYTES_PER_ELEMENT;
-
-    // 选择当前节点的顶点 buffer，后续 vertexAttribPointer 都会从这个 ARRAY_BUFFER 读数据。
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
-    // 开启 a_position 属性，并说明它从 buffer 的第 0 字节开始，每次读 3 个 float。
-    gl.enableVertexAttribArray(program.locations.position);
-    gl.vertexAttribPointer(program.locations.position, 3, gl.FLOAT, false, stride, 0);
-    // 开启 a_color 属性，并说明它从每个顶点的第 4 个 float 开始读取 rgb。
-    gl.enableVertexAttribArray(program.locations.color);
-    gl.vertexAttribPointer(program.locations.color, 3, gl.FLOAT, false, stride, 3 * Float32Array.BYTES_PER_ELEMENT);
-    // model matrix 是每个节点自己的局部到世界变换。不同节点 draw 前可以传不同矩阵。
-    gl.uniformMatrix4fv(program.locations.model, false, this.modelMatrix);
-    // drawArrays 根据 drawMode 解释顶点：LINES 画线段，TRIANGLES 画三角面。
-    gl.drawArrays(this.drawMode, 0, this.vertexCount);
-    gl.bindBuffer(gl.ARRAY_BUFFER, null);
+  render(gl, renderState) {
+    this.material.apply(renderState, this);
+    this.geometry.draw(gl, this.material.program);
   }
 }
 
@@ -384,7 +514,7 @@ class Scene {
   }
 
   remove(node) {
-    // TODO: 实现删除节点。删除时还应考虑释放 GPU buffer：gl.deleteBuffer(node.buffer)。
+    // TODO: 实现删除节点。删除时还应考虑释放 geometry buffer：gl.deleteBuffer(node.geometry.buffer)。
     const index = this.nodes.indexOf(node);
     if (index >= 0) {
       this.nodes.splice(index, 1);
@@ -396,10 +526,10 @@ class Scene {
     return this.nodes.find((node) => node.hitTest(ray)) || null;
   }
 
-  render(gl, program) {
+  render(gl, renderState) {
     // Scene 不直接关心 WebGL 细节，只负责按顺序要求每个节点渲染自己。
     for (const node of this.nodes) {
-      node.render(gl, program);
+      node.render(gl, renderState);
     }
   }
 }
@@ -538,25 +668,48 @@ function toNdc(normalizedX, normalizedY) {
 }
 
 class MeshFactory {
-  // 返回立方体顶点数据。用 TRIANGLES，每个顶点包含 position + color。
+  // 返回立方体顶点数据。用 TRIANGLES，每个顶点包含 position + normal + color。
   static createCube(color = [0.8, 0.35, 0.25]) {
     const [red, green, blue] = color;
     const faces = [
-     [[-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5], [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5]], // front
-     [[ 0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5]], // back
-     [[-0.5, -0.5, -0.5], [-0.5, -0.5,  0.5], [-0.5,  0.5,  0.5], [-0.5,  0.5, -0.5]], // left
-     [[ 0.5, -0.5,  0.5], [ 0.5, -0.5, -0.5], [ 0.5,  0.5, -0.5], [ 0.5,  0.5,  0.5]], // right
-     [[-0.5,  0.5,  0.5], [ 0.5,  0.5,  0.5], [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5]], // top
-     [[-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5], [ 0.5, -0.5,  0.5], [-0.5, -0.5,  0.5]], // bottom
-    ]
+      {
+        normal: [0, 0, 1],
+        points: [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]],
+      },
+      {
+        normal: [0, 0, -1],
+        points: [[0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5]],
+      },
+      {
+        normal: [-1, 0, 0],
+        points: [[-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5]],
+      },
+      {
+        normal: [1, 0, 0],
+        points: [[0.5, -0.5, 0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5]],
+      },
+      {
+        normal: [0, 1, 0],
+        points: [[-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5]],
+      },
+      {
+        normal: [0, -1, 0],
+        points: [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]],
+      },
+    ];
     // 每个面用两个三角形，注意 winding 顺序要和 CULL_FACE 匹配。
-    const vertices = []
-    for (const [p0, p1, p2, p3] of faces) {
+    const vertices = [];
+    for (const { normal, points } of faces) {
+      const [p0, p1, p2, p3] = points;
       for (const point of [p0, p1, p2, p0, p2, p3]) {
-        vertices.push(point[0], point[1], point[2], red, green, blue)
+        vertices.push(
+          point[0], point[1], point[2],
+          normal[0], normal[1], normal[2],
+          red, green, blue,
+        );
       }
     }
-    return new Float32Array(vertices)
+    return new Float32Array(vertices);
   }
 
   static createSphere() {
@@ -758,7 +911,10 @@ class Viewer {
     // 具体的建模业务尽量放进 Node/Scene/Interaction，不要塞进 Viewer。
     this.canvas = canvas;
     this.gl = this.createContext(canvas);
-    this.program = new RenderProgram(this.gl);
+    this.unlitShader = new ShaderProgram(this.gl, vertexShaderSource, fragmentShaderSource);
+    this.lambertShader = new ShaderProgram(this.gl, litVertexShaderSource, litFragmentShaderSource);
+    this.unlitMaterial = new UnlitMaterial(this.unlitShader);
+    this.lambertMaterial = new LambertMaterial(this.lambertShader);
     this.scene = new Scene();
     this.camera = new Camera();
     this.selection = new SelectionManager(this.scene, this.camera);
@@ -830,9 +986,26 @@ class Viewer {
 
   seedScene() {
     // 初始场景只放一个网格，目的是确认 WebGL 管线、相机和 resize 都正常。
-    // TODO: 你可以在这里添加 MeshFactory.createCube() 生成的节点，作为第一个建模对象。
-    this.scene.add(new Node(buildGrid(10, 1), this.gl.LINES));
-    this.scene.add(new Node(MeshFactory.createCube(), this.gl.TRIANGLES));
+    const gridGeometry = new Geometry(
+      buildGrid(10, 1),
+      this.gl.LINES,
+      [
+        { name: "a_position", size: 3, offset: 0 },
+        { name: "a_color", size: 3, offset: 3 },
+      ],
+    );
+    const cubeGeometry = new Geometry(
+      MeshFactory.createCube(),
+      this.gl.TRIANGLES,
+      [
+        { name: "a_position", size: 3, offset: 0 },
+        { name: "a_normal", size: 3, offset: 3 },
+        { name: "a_color", size: 3, offset: 6 },
+      ],
+    );
+
+    this.scene.add(new Node(gridGeometry, this.unlitMaterial));
+    this.scene.add(new Node(cubeGeometry, this.lambertMaterial));
   }
 
   resize() {
@@ -864,8 +1037,10 @@ class Viewer {
     const gl = this.gl;
     // 每帧都要清掉上一帧的颜色和深度，否则会残留旧画面或旧深度。
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-    this.program.use(this.camera.projectionMatrix, this.camera.viewMatrix);
-    this.scene.render(gl, this.program);
+    this.scene.render(gl, {
+      projectionMatrix: this.camera.projectionMatrix,
+      viewMatrix: this.camera.viewMatrix,
+    });
   }
 }
 
