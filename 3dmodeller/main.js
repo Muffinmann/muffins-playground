@@ -108,6 +108,8 @@ in vec3 v_normal;
 uniform vec3 u_lightDirection;
 // ambient light：最低亮度，避免背光面完全黑掉。
 uniform vec3 u_ambientLight;
+// emission：不受灯光方向影响的额外发光色，用于选中高亮。
+uniform vec3 u_emission;
 
 out vec4 outColor;
 
@@ -117,7 +119,7 @@ void main() {
   float diffuse = max(dot(normal, lightDirection), 0.0);
   vec3 litColor = v_color * (u_ambientLight + diffuse);
 
-  outColor = vec4(litColor, 1.0);
+  outColor = vec4(litColor + u_emission, 1.0);
 }
 `;
 
@@ -723,6 +725,7 @@ class LambertMaterial extends Material {
     super.apply(renderState, node);
     this.program.setVector3("u_lightDirection", this.lightDirection);
     this.program.setVector3("u_ambientLight", this.ambientLight);
+    this.program.setVector3("u_emission", node.selected ? [0.25, 0.25, 0.18] : [0, 0, 0]);
   }
 }
 
@@ -750,6 +753,7 @@ class Node {
     this.material = material;
     this.transform = new Transform();
     this.modelMatrix = createIdentityMatrix();
+    this.selected = false;
   }
 
   hitTest(ray) {
@@ -923,11 +927,22 @@ class SelectionManager {
   }
 
   select(node) {
-    // TODO: 选择节点后，可以给节点设置 selected 状态，并让 fragment shader 做高亮。
+    if (this.selectedNode) {
+      this.selectedNode.selected = false;
+    }
+
     this.selectedNode = node;
+
+    if (node) {
+      node.selected = true;
+    }
   }
 
   clear() {
+    if (this.selectedNode) {
+      this.selectedNode.selected = false;
+    }
+
     this.selectedNode = null;
     this.lastMovePoint = null;
     this.movePlanePoint = null;
@@ -1072,9 +1087,52 @@ class MeshFactory {
     return new Float32Array(vertices);
   }
 
-  static createSphere() {
-    // TODO: 用经纬线或细分多面体生成球体顶点。
-    throw new Error("MeshFactory.createSphere is a modelling exercise TODO.");
+  static createSphere(color = [0.25, 0.55, 0.9], radius = 0.5, latitudeBands = 16, longitudeBands = 24) {
+    const [red, green, blue] = color;
+    const vertices = [];
+
+    const spherePoint = (latitude, longitude) => {
+      const theta = (latitude / latitudeBands) * Math.PI;
+      const phi = (longitude / longitudeBands) * Math.PI * 2;
+      const sinTheta = Math.sin(theta);
+      const normal = [
+        sinTheta * Math.cos(phi),
+        Math.cos(theta),
+        sinTheta * Math.sin(phi),
+      ];
+
+      return {
+        position: [
+          normal[0] * radius,
+          normal[1] * radius,
+          normal[2] * radius,
+        ],
+        normal,
+      };
+    };
+
+    const pushVertex = (point) => {
+      vertices.push(
+        point.position[0], point.position[1], point.position[2],
+        point.normal[0], point.normal[1], point.normal[2],
+        red, green, blue,
+      );
+    };
+
+    for (let latitude = 0; latitude < latitudeBands; latitude += 1) {
+      for (let longitude = 0; longitude < longitudeBands; longitude += 1) {
+        const topLeft = spherePoint(latitude, longitude);
+        const topRight = spherePoint(latitude, longitude + 1);
+        const bottomLeft = spherePoint(latitude + 1, longitude);
+        const bottomRight = spherePoint(latitude + 1, longitude + 1);
+
+        for (const point of [topLeft, topRight, bottomRight, topLeft, bottomRight, bottomLeft]) {
+          pushVertex(point);
+        }
+      }
+    }
+
+    return new Float32Array(vertices);
   }
 
   static createCylinder() {
@@ -1307,6 +1365,63 @@ class Viewer {
     this.interaction.registerCallback("zoom", (input) => {
       this.camera.zoom(input.delta);
     });
+
+    this.interaction.registerCallback("place", ({ shape, pointer }) => {
+      this.placeShape(shape, pointer);
+    });
+  }
+
+  createLitGeometry(vertices) {
+    return new Geometry(
+      vertices,
+      this.gl.TRIANGLES,
+      [
+        { name: "a_position", size: 3, offset: 0 },
+        { name: "a_normal", size: 3, offset: 3 },
+        { name: "a_color", size: 3, offset: 6 },
+      ],
+    );
+  }
+
+  createGeometryForShape(shape) {
+    if (shape === "cube") {
+      return this.createLitGeometry(MeshFactory.createCube());
+    }
+
+    if (shape === "sphere") {
+      return this.createLitGeometry(MeshFactory.createSphere());
+    }
+
+    return null;
+  }
+
+  placeShape(shape, pointer) {
+    const ray = this.selection.createRayFromPointer(pointer.x, pointer.y);
+
+    if (!ray) {
+      return null;
+    }
+
+    const position = intersectRayPlane(ray, [0, 0, 0], [0, 1, 0]);
+
+    if (!position) {
+      return null;
+    }
+
+    const geometry = this.createGeometryForShape(shape);
+
+    if (!geometry) {
+      return null;
+    }
+
+    const node = new Node(geometry, this.lambertMaterial);
+    node.transform.position = position;
+    node.updateModelMatrix();
+
+    this.scene.add(node);
+    this.selection.select(node);
+
+    return node;
   }
 
   createContext(canvas) {
@@ -1353,15 +1468,7 @@ class Viewer {
         { name: "a_color", size: 3, offset: 3 },
       ],
     );
-    const cubeGeometry = new Geometry(
-      MeshFactory.createCube(),
-      this.gl.TRIANGLES,
-      [
-        { name: "a_position", size: 3, offset: 0 },
-        { name: "a_normal", size: 3, offset: 3 },
-        { name: "a_color", size: 3, offset: 6 },
-      ],
-    );
+    const cubeGeometry = this.createLitGeometry(MeshFactory.createCube());
 
     this.scene.add(new Node(gridGeometry, this.unlitMaterial));
     this.scene.add(new Node(cubeGeometry, this.lambertMaterial));
