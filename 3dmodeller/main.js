@@ -746,6 +746,28 @@ class Transform {
 }
 
 class Node {
+  static fromLitMesh(vertices, drawMode, material) {
+    const geometry = new Geometry(
+      vertices,
+      drawMode,
+      [
+        { name: "a_position", size: 3, offset: 0 },
+        { name: "a_normal", size: 3, offset: 3 },
+        { name: "a_color", size: 3, offset: 6 },
+      ],
+    );
+
+    return new Node(geometry, material);
+  }
+
+  static cube(drawMode, material) {
+    return Node.fromLitMesh(MeshFactory.createCube(), drawMode, material);
+  }
+
+  static sphere(drawMode, material) {
+    return Node.fromLitMesh(MeshFactory.createSphere(), drawMode, material);
+  }
+
   constructor(geometry, material) {
     // Node 是 scene graph 的最小渲染单元。
     // 它只组合 transform + geometry + material；不要再让 Node 管 shader/buffer 细节。
@@ -781,6 +803,10 @@ class Scene {
     // TODO: 后续可以把 flat list 升级成 scene graph：
     // GroupNode 持有 children，遍历时把父子 transform 组合起来。
     this.nodes = [];
+    this.selectedNode = null;
+    this.lastMovePoint = null;
+    this.movePlanePoint = null;
+    this.movePlaneNormal = null;
   }
 
   add(node) {
@@ -793,6 +819,10 @@ class Scene {
     const index = this.nodes.indexOf(node);
     if (index >= 0) {
       this.nodes.splice(index, 1);
+    }
+
+    if (node === this.selectedNode) {
+      this.clearSelection();
     }
   }
 
@@ -810,6 +840,103 @@ class Scene {
     }
 
     return nearestNode;
+  }
+
+  select(node) {
+    if (this.selectedNode) {
+      this.selectedNode.selected = false;
+    }
+
+    this.selectedNode = node;
+
+    if (node) {
+      node.selected = true;
+    }
+  }
+
+  clearSelection() {
+    if (this.selectedNode) {
+      this.selectedNode.selected = false;
+    }
+
+    this.selectedNode = null;
+    this.lastMovePoint = null;
+    this.movePlanePoint = null;
+    this.movePlaneNormal = null;
+  }
+
+  pick(ray, movePlaneNormal) {
+    if (!ray) {
+      this.clearSelection();
+      return null;
+    }
+
+    const node = this.findByRay(ray);
+
+    if (node) {
+      this.select(node);
+      this.movePlanePoint = [...node.transform.position];
+      this.movePlaneNormal = movePlaneNormal;
+      this.lastMovePoint = intersectRayPlane(ray, this.movePlanePoint, this.movePlaneNormal);
+    } else {
+      this.clearSelection();
+    }
+
+    return node;
+  }
+
+  moveSelected(ray, fallbackMovePlaneNormal) {
+    if (!this.selectedNode || !ray) {
+      return null;
+    }
+
+    if (!this.movePlanePoint || !this.movePlaneNormal) {
+      this.movePlanePoint = [...this.selectedNode.transform.position];
+      this.movePlaneNormal = fallbackMovePlaneNormal;
+    }
+
+    const currentPoint = intersectRayPlane(ray, this.movePlanePoint, this.movePlaneNormal);
+
+    if (!currentPoint) {
+      return null;
+    }
+
+    if (!this.lastMovePoint) {
+      this.lastMovePoint = currentPoint;
+      return this.selectedNode.transform.position;
+    }
+
+    const delta = subtractVectors(currentPoint, this.lastMovePoint);
+    const position = this.selectedNode.transform.position;
+    this.selectedNode.transform.position = [
+      position[0] + delta[0],
+      position[1] + delta[1],
+      position[2] + delta[2],
+    ];
+    this.selectedNode.updateModelMatrix();
+    this.lastMovePoint = currentPoint;
+
+    return this.selectedNode.transform.position;
+  }
+
+  placeNode(node, ray) {
+    if (!node || !ray) {
+      return null;
+    }
+
+    const position = intersectRayPlane(ray, [0, 0, 0], [0, 1, 0]);
+
+    if (!position) {
+      return null;
+    }
+
+    node.transform.position = position;
+    node.updateModelMatrix();
+
+    this.add(node);
+    this.select(node);
+
+    return node;
   }
 
   render(gl, renderState) {
@@ -914,123 +1041,6 @@ class Camera {
     this.updateViewMatrix()
   }
 
-}
-
-class SelectionManager {
-  constructor(scene, camera) {
-    this.scene = scene;
-    this.camera = camera;
-    this.selectedNode = null;
-    this.lastMovePoint = null;
-    this.movePlanePoint = null;
-    this.movePlaneNormal = null;
-  }
-
-  select(node) {
-    if (this.selectedNode) {
-      this.selectedNode.selected = false;
-    }
-
-    this.selectedNode = node;
-
-    if (node) {
-      node.selected = true;
-    }
-  }
-
-  clear() {
-    if (this.selectedNode) {
-      this.selectedNode.selected = false;
-    }
-
-    this.selectedNode = null;
-    this.lastMovePoint = null;
-    this.movePlanePoint = null;
-    this.movePlaneNormal = null;
-  }
-
-  createRayFromPointer(normalizedX, normalizedY) {
-    const ndc = toNdc(normalizedX, normalizedY);
-    const viewProjection = multiplyMatrix4(this.camera.projectionMatrix, this.camera.viewMatrix);
-    const inverseViewProjection = invertMatrix4(viewProjection);
-
-    if (!inverseViewProjection) {
-      return null;
-    }
-
-    const nearClip = [ndc.x, ndc.y, -1, 1];
-    const farClip = [ndc.x, ndc.y, 1, 1];
-    const nearWorld = homogeneousDivide(transformPoint4(inverseViewProjection, nearClip));
-    const farWorld = homogeneousDivide(transformPoint4(inverseViewProjection, farClip));
-
-    return {
-      // 使用 near plane 作为 origin：它是可见视锥的起点，比 eye 更贴近“屏幕上这个像素”。
-      origin: nearWorld,
-      direction: normalizeVector(subtractVectors(farWorld, nearWorld)),
-    };
-  }
-
-  pick(normalizedX, normalizedY) {
-    const ray = this.createRayFromPointer(normalizedX, normalizedY);
-
-    if (!ray) {
-      this.clear();
-      return null;
-    }
-
-    const node = this.scene.findByRay(ray);
-
-    if (node) {
-      this.select(node);
-      this.movePlanePoint = [...node.transform.position];
-      this.movePlaneNormal = normalizeVector(subtractVectors(this.camera.eye, this.camera.target));
-      this.lastMovePoint = intersectRayPlane(ray, this.movePlanePoint, this.movePlaneNormal);
-    } else {
-      this.clear();
-    }
-
-    return node;
-  }
-
-  moveSelected(normalizedX, normalizedY) {
-    if (!this.selectedNode) {
-      return null;
-    }
-
-    const ray = this.createRayFromPointer(normalizedX, normalizedY);
-
-    if (!ray) {
-      return null;
-    }
-
-    if (!this.movePlanePoint || !this.movePlaneNormal) {
-      this.movePlanePoint = [...this.selectedNode.transform.position];
-      this.movePlaneNormal = normalizeVector(subtractVectors(this.camera.eye, this.camera.target));
-    }
-
-    const currentPoint = intersectRayPlane(ray, this.movePlanePoint, this.movePlaneNormal);
-
-    if (!currentPoint) {
-      return null;
-    }
-
-    if (!this.lastMovePoint) {
-      this.lastMovePoint = currentPoint;
-      return this.selectedNode.transform.position;
-    }
-
-    const delta = subtractVectors(currentPoint, this.lastMovePoint);
-    const position = this.selectedNode.transform.position;
-    this.selectedNode.transform.position = [
-      position[0] + delta[0],
-      position[1] + delta[1],
-      position[2] + delta[2],
-    ];
-    this.selectedNode.updateModelMatrix();
-    this.lastMovePoint = currentPoint;
-
-    return this.selectedNode.transform.position;
-  }
 }
 
 function toNdc(normalizedX, normalizedY) {
@@ -1264,7 +1274,7 @@ class Interaction {
     this.previousPointer = input;
 
     if (input.button === MouseButtons.LEFT) {
-      // AOSA 语义：左键按下先尝试 pick。真正的选择逻辑由 SelectionManager callback 实现。
+      // AOSA 语义：左键按下先尝试 pick。真正的选择逻辑由 Scene callback 实现。
       this.trigger("pick", input);
     }
   }
@@ -1335,7 +1345,6 @@ class Viewer {
     this.lambertMaterial = new LambertMaterial(this.lambertShader);
     this.scene = new Scene();
     this.camera = new Camera();
-    this.selection = new SelectionManager(this.scene, this.camera);
     this.interaction = new Interaction();
     this.inputAdapter = new BrowserInputAdapter(canvas, this.interaction);
     this.registerInteractionCallbacks();
@@ -1347,11 +1356,13 @@ class Viewer {
 
   registerInteractionCallbacks() {
     this.interaction.registerCallback("pick", (pointer) => {
-      this.selection.pick(pointer.x, pointer.y);
+      const ray = this.createRayFromPointer(pointer.x, pointer.y);
+      this.scene.pick(ray, this.cameraMovePlaneNormal());
     });
 
     this.interaction.registerCallback("move", (pointer) => {
-      this.selection.moveSelected(pointer.x, pointer.y);
+      const ray = this.createRayFromPointer(pointer.x, pointer.y);
+      this.scene.moveSelected(ray, this.cameraMovePlaneNormal());
     });
 
     this.interaction.registerCallback("orbit", (pointer) => {
@@ -1367,61 +1378,47 @@ class Viewer {
     });
 
     this.interaction.registerCallback("place", ({ shape, pointer }) => {
-      this.placeShape(shape, pointer);
+      const ray = this.createRayFromPointer(pointer.x, pointer.y);
+      const node = this.createNodeForShape(shape);
+      this.scene.placeNode(node, ray);
     });
   }
 
-  createLitGeometry(vertices) {
-    return new Geometry(
-      vertices,
-      this.gl.TRIANGLES,
-      [
-        { name: "a_position", size: 3, offset: 0 },
-        { name: "a_normal", size: 3, offset: 3 },
-        { name: "a_color", size: 3, offset: 6 },
-      ],
-    );
+  cameraMovePlaneNormal() {
+    return normalizeVector(subtractVectors(this.camera.eye, this.camera.target));
   }
 
-  createGeometryForShape(shape) {
+  createRayFromPointer(normalizedX, normalizedY) {
+    const ndc = toNdc(normalizedX, normalizedY);
+    const viewProjection = multiplyMatrix4(this.camera.projectionMatrix, this.camera.viewMatrix);
+    const inverseViewProjection = invertMatrix4(viewProjection);
+
+    if (!inverseViewProjection) {
+      return null;
+    }
+
+    const nearClip = [ndc.x, ndc.y, -1, 1];
+    const farClip = [ndc.x, ndc.y, 1, 1];
+    const nearWorld = homogeneousDivide(transformPoint4(inverseViewProjection, nearClip));
+    const farWorld = homogeneousDivide(transformPoint4(inverseViewProjection, farClip));
+
+    return {
+      // 使用 near plane 作为 origin：它是可见视锥的起点，比 eye 更贴近“屏幕上这个像素”。
+      origin: nearWorld,
+      direction: normalizeVector(subtractVectors(farWorld, nearWorld)),
+    };
+  }
+
+  createNodeForShape(shape) {
     if (shape === "cube") {
-      return this.createLitGeometry(MeshFactory.createCube());
+      return Node.cube(this.gl.TRIANGLES, this.lambertMaterial);
     }
 
     if (shape === "sphere") {
-      return this.createLitGeometry(MeshFactory.createSphere());
+      return Node.sphere(this.gl.TRIANGLES, this.lambertMaterial);
     }
 
     return null;
-  }
-
-  placeShape(shape, pointer) {
-    const ray = this.selection.createRayFromPointer(pointer.x, pointer.y);
-
-    if (!ray) {
-      return null;
-    }
-
-    const position = intersectRayPlane(ray, [0, 0, 0], [0, 1, 0]);
-
-    if (!position) {
-      return null;
-    }
-
-    const geometry = this.createGeometryForShape(shape);
-
-    if (!geometry) {
-      return null;
-    }
-
-    const node = new Node(geometry, this.lambertMaterial);
-    node.transform.position = position;
-    node.updateModelMatrix();
-
-    this.scene.add(node);
-    this.selection.select(node);
-
-    return node;
   }
 
   createContext(canvas) {
@@ -1468,10 +1465,12 @@ class Viewer {
         { name: "a_color", size: 3, offset: 3 },
       ],
     );
-    const cubeGeometry = this.createLitGeometry(MeshFactory.createCube());
+    const cubeNode = this.createNodeForShape("cube");
 
     this.scene.add(new Node(gridGeometry, this.unlitMaterial));
-    this.scene.add(new Node(cubeGeometry, this.lambertMaterial));
+    if (cubeNode) {
+      this.scene.add(cubeNode);
+    }
   }
 
   resize() {
