@@ -66,6 +66,36 @@ viewPosition = viewMatrix * worldPosition
 Conceptually, this applies the inverse of the camera transform to the whole world,
 so the camera can be treated as if it were at the origin.
 
+## Camera Look-At Matrix
+
+The camera is defined by:
+
+```text
+eye    = camera position
+target = point the camera is looking at
+up     = the approximate world direction that should appear upward on screen
+```
+
+For example:
+
+```js
+eye = [5, 4, 7];
+target = [0, 0, 0];
+up = [0, 1, 0];
+```
+
+The look-at matrix builds a camera basis:
+
+```text
+xAxis = camera right
+yAxis = camera up
+zAxis = camera back
+```
+
+The `zAxis` points behind the camera, not forward. This matches the usual
+OpenGL/WebGL camera convention where the camera looks down negative z in view
+space.
+
 ## View / Camera Space
 
 View space is the scene as seen from the camera. In the usual OpenGL/WebGL
@@ -88,6 +118,9 @@ clipPosition = projectionMatrix * viewPosition
 
 For a perspective camera, the projection matrix is what creates the near-large,
 far-small effect.
+
+The near and far planes also affect depth-buffer precision. A needlessly tiny
+near plane or extremely distant far plane can make depth conflicts more visible.
 
 ## Clip Space
 
@@ -150,6 +183,9 @@ y = +1 at the top
 y = -1 at the bottom
 ```
 
+`main.js` keeps pointer state in normalized DOM/canvas coordinates and only
+derives NDC at the point where picking or unprojection needs WebGL coordinates.
+
 ## Viewport / Screen Pixels
 
 The viewport maps NDC into actual canvas pixels. In `Viewer.resize()` this is set
@@ -168,6 +204,11 @@ screenY = (ndcY + 1) / 2 * height
 
 Browser pointer coordinates and WebGL viewport coordinates differ in y direction,
 which is why pointer input is flipped when converting to NDC.
+
+On high-DPI screens, the canvas CSS size differs from the drawing-buffer size.
+The drawing-buffer size needs to be multiplied by `devicePixelRatio`, and the
+camera projection must be updated when the canvas size changes so the image does
+not stretch.
 
 ## Picking Flow
 
@@ -205,6 +246,10 @@ createRayFromPointer(normalizedX, normalizedY) {
   };
 }
 ```
+
+The implementation in `main.js` uses the near plane as the ray origin. That is
+the visible frustum start and is closer to the idea of "this exact pixel on the
+screen" than using `camera.eye` directly.
 
 `unproject()` must multiply by the inverse view-projection matrix and then divide
 by `w`:
@@ -264,6 +309,33 @@ buffer and read the pixel under the pointer. That can match the visible result
 well, but it introduces extra rendering work and `readPixels` synchronization
 costs.
 
+`main.js` currently uses the slab method for ray/AABB tests: compute the ray's
+enter and exit interval for the x, y, and z axis-aligned slabs. If the three
+intervals overlap, the ray passes through the AABB.
+
+Object movement projects the pointer ray onto a movement plane. Camera panning
+moves both `eye` and `target`, so the view slides across the work plane. Camera
+zoom moves `eye` along the `eye -> target` direction while clamping the distance.
+
+## Matrix Storage
+
+WebGL and GLSL interpret `mat4` data passed to `uniformMatrix4fv()` as
+column-major. The helper matrices in `main.js` use the same layout.
+
+In a column-major transform matrix, the translation components live in the last
+column:
+
+```text
+[ ..., ..., ..., tx,
+  ..., ..., ..., ty,
+  ..., ..., ..., tz,
+  ..., ..., ...,  1 ]
+```
+
+The matrix multiplication helper returns the same result as GLSL `a * b`.
+Picking needs the inverse of `projection * view` to unproject clip-space points
+back into world space.
+
 ## Short Summary
 
 Rendering goes forward:
@@ -277,4 +349,3 @@ Picking goes backward:
 ```text
 screen -> NDC -> clip -> world ray -> scene hit test
 ```
-
